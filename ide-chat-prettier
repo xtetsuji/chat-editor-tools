@@ -23,16 +23,19 @@ Examples:
   ide-chat-prettier cursor_export.md
   ide-chat-prettier cursor_export.md formatted_output.md
   ide-chat-prettier --github-user myusername vscode_export.md
+  ide-chat-prettier --max-size 60000 large_export.md
   
 Options:
   -h, --help                 Show this help message
   -v, --version              Show version information
   -g, --github-user USER     Specify GitHub username for VS Code exports
+  -m, --max-size SIZE        Split output if larger than SIZE bytes (default: no split)
   
 Notes:
   - For VS Code exports, the tool will attempt to detect your GitHub username
     automatically using 'gh api /user' if GitHub CLI is available
   - You can override this with the --github-user option
+  - Use --max-size to split large outputs for GitHub comment limits (65536 chars)
   
 EOF
 }
@@ -315,17 +318,76 @@ sub escape_html {
     return $text;
 }
 
+sub split_by_size {
+    my ($content, $max_size, $title) = @_;
+    
+    # max_sizeが指定されていない場合はそのまま返す
+    return ($content) unless $max_size && $max_size > 0;
+    
+    # 現在のサイズが制限以下の場合もそのまま返す
+    return ($content) if length($content) <= $max_size;
+    
+    # タイトル行を抽出
+    my $title_line = '';
+    if ($content =~ /^(# .*?)\n\n/) {
+        $title_line = $1;
+    } elsif ($title) {
+        $title_line = "# $title";
+    } else {
+        $title_line = "# Chat Session";
+    }
+    
+    # <details>ブロックごとに分割
+    my @blocks = split(/(?=<details>)/, $content);
+    my $header = shift @blocks || '';  # タイトル部分
+    
+    my @parts = ();
+    my $current_part = $header;
+    my $part_number = 1;
+    
+    for my $block (@blocks) {
+        next unless $block;
+        
+        # 現在のパートにブロックを追加した場合のサイズを計算
+        my $test_content = $current_part . $block;
+        
+        if (length($test_content) > $max_size && $current_part ne $header) {
+            # 現在のパートを確定して新しいパートを開始
+            push @parts, $current_part;
+            $current_part = $header;
+            $current_part =~ s/^# (.*)$/"# $1 (" . $part_number . "\/TBD)"/e;
+            $part_number++;
+        }
+        
+        $current_part .= $block;
+    }
+    
+    # 最後のパートを追加
+    push @parts, $current_part if $current_part;
+    
+    # パート番号を正しく更新
+    my $total_parts = scalar @parts;
+    for my $i (0 .. $#parts) {
+        my $part_num = $i + 1;
+        $parts[$i] =~ s/^# (.+?) \(\d+\/TBD\)/"# $1 ($part_num\/$total_parts)"/e;
+    }
+    
+    return @parts;
+}
+
 # メイン処理
 sub main {
     my $help = 0;
     my $version = 0;
     my $github_user = '';
+    my $max_size = 0;
     
     # コマンドラインオプションの解析
     my $result = GetOptions(
         'help|h'         => \$help,
         'version|v'      => \$version,
         'github-user|g=s' => \$github_user,
+        'max-size|m=i'   => \$max_size,
     );
     
     if (!$result) {
@@ -383,14 +445,43 @@ sub main {
     # フォーマット処理
     my $formatted = format_cursor_export($content, $github_user);
     
+    # サイズ制限による分割処理
+    my @parts = split_by_size($formatted, $max_size);
+    
     # 出力
     if ($output_file) {
-        open my $out_fh, '>:utf8', $output_file or die "Cannot create '$output_file': $!";
-        print $out_fh $formatted;
-        close $out_fh;
-        print "Formatted output written to: $output_file\n";
+        if (@parts > 1) {
+            # 複数パートに分割された場合
+            for my $i (0 .. $#parts) {
+                my $part_num = $i + 1;
+                my $part_file = $output_file;
+                if ($part_file =~ s/(\.[^.]+)$/_part$part_num$1/) {
+                    # 拡張子がある場合
+                } else {
+                    # 拡張子がない場合
+                    $part_file .= "_part$part_num";
+                }
+                
+                open my $out_fh, '>:utf8', $part_file or die "Cannot create '$part_file': $!";
+                print $out_fh $parts[$i];
+                close $out_fh;
+                print "Part $part_num written to: $part_file\n";
+            }
+            print "Split into " . scalar(@parts) . " parts due to size limit ($max_size bytes)\n";
+        } else {
+            # 単一ファイル出力
+            open my $out_fh, '>:utf8', $output_file or die "Cannot create '$output_file': $!";
+            print $out_fh $formatted;
+            close $out_fh;
+            print "Formatted output written to: $output_file\n";
+        }
     } else {
-        print $formatted;
+        if (@parts > 1) {
+            # stdout出力の場合は警告して最初のパートのみ表示
+            print STDERR "Warning: Output split into " . scalar(@parts) . " parts. Showing first part only.\n";
+            print STDERR "Use --output option to save all parts.\n\n";
+        }
+        print $parts[0];
     }
     
     return 0;
