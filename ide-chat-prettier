@@ -106,36 +106,76 @@ sub format_cursor_style {
     # エクスポート情報行（_Exported on...）を削除
     $content =~ s/^_Exported on.*?_\s*\n//gm;
     
-    # セクション区切り（---）で分割
-    my @sections = split(/\n---\n/, $content);
-    
-    # 最初のセクションはタイトル部分
-    my $title = shift @sections || '';
-    $title =~ s/^\s+|\s+$//g; # 前後の空白を削除
+    # タイトル部分を抽出（最初の---より前）
+    my $title = '';
+    if ($content =~ /^(.*?)\n---\n/s) {
+        $title = $1;
+        $title =~ s/^\s+|\s+$//g;
+    }
     
     my $result = "$title\n\n";
+    my @conversations = ();
     
-    # User/Cursorのやり取りをペアで処理
-    for (my $i = 0; $i < @sections; $i += 2) {
-        my $user_section = $sections[$i] // '';
-        my $cursor_section = $sections[$i + 1] // '';
+    # **User**と**Cursor**のペアを直接解析
+    my @lines = split(/\n/, $content);
+    my $current_speaker = '';
+    my $current_content = '';
+    my $in_conversation = 0;
+    
+    for my $line (@lines) {
+        # **User**または**Cursor**を発話者として認識
+        if ($line =~ /^\*\*(User|Cursor)\*\*\s*$/) {
+            # 前の発話者の内容を保存
+            if ($current_speaker && $current_content) {
+                push @conversations, {
+                    speaker => $current_speaker,
+                    content => $current_content
+                };
+            }
+            $current_speaker = $1;
+            $current_content = '';
+            $in_conversation = 1;
+        }
+        # ---区切りは無視（会話が続いている場合）
+        elsif ($line eq '---' && $in_conversation) {
+            # 区切り行は無視して継続
+            next;
+        }
+        # 通常の内容行
+        elsif ($in_conversation && $current_speaker) {
+            # 空行でない、または既に内容がある場合は追加
+            if ($line ne '' || $current_content ne '') {
+                $current_content .= ($current_content ? "\n" : '') . $line;
+            }
+        }
+    }
+    
+    # 最後の会話を追加
+    if ($current_speaker && $current_content) {
+        push @conversations, {
+            speaker => $current_speaker,
+            content => $current_content
+        };
+    }
+    
+    # 会話をペアで処理
+    for (my $i = 0; $i < @conversations; $i += 2) {
+        my $user_conv = $conversations[$i];
+        my $cursor_conv = $conversations[$i + 1];
         
-        # セクションが空の場合はスキップ
-        next if !$user_section || !$cursor_section;
+        next unless $user_conv && $cursor_conv;
+        next unless $user_conv->{speaker} eq 'User' && $cursor_conv->{speaker} eq 'Cursor';
         
-        # Userセクションから**User**を削除してクリーンアップ
-        $user_section =~ s/^\s*\*\*User\*\*\s*\n?//;
-        $user_section =~ s/^\s+|\s+$//g;
+        my $user_content = $user_conv->{content};
+        my $cursor_content = $cursor_conv->{content};
         
-        # Cursorセクションから**Cursor**を削除してクリーンアップ
-        $cursor_section =~ s/^\s*\*\*Cursor\*\*\s*\n?//;
-        $cursor_section =~ s/^\s+|\s+$//g;
+        $user_content =~ s/^\s+|\s+$//g;
+        $cursor_content =~ s/^\s+|\s+$//g;
         
-        # セクションが空の場合はスキップ
-        next if !$user_section || !$cursor_section;
+        next if !$user_content || !$cursor_content;
         
         # Userコメントの最初の行をサマリとして使用
-        my ($summary) = split(/\n/, $user_section, 2);
+        my ($summary) = split(/\n/, $user_content, 2);
         $summary =~ s/^\s+|\s+$//g;
         
         # 長すぎるサマリは単語境界で切り詰める
@@ -153,9 +193,9 @@ sub format_cursor_style {
         $result .= "<details>\n";
         $result .= "<summary>$summary</summary>\n\n";
         $result .= "**User:**\n\n";
-        $result .= "$user_section\n\n";
+        $result .= "$user_content\n\n";
         $result .= "**Cursor:**\n\n";
-        $result .= "$cursor_section\n\n";
+        $result .= "$cursor_content\n\n";
         $result .= "</details>\n\n";
     }
     
