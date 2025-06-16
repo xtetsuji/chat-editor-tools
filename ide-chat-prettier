@@ -1,0 +1,542 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use utf8;
+use Getopt::Long qw(:config no_ignore_case bundling);
+
+# UTF-8での入出力を有効にする
+binmode(STDIN, ':utf8');
+binmode(STDOUT, ':utf8');
+binmode(STDERR, ':utf8');
+
+# バージョン情報
+my $VERSION = '1.0.0';
+
+sub show_help {
+    print <<'EOF';
+IDE Chat Export Formatter
+
+Usage:
+  ide-chat-prettier [options] <input-file> [output-file]
+  
+Examples:
+  ide-chat-prettier cursor_export.md
+  ide-chat-prettier cursor_export.md formatted_output.md
+  ide-chat-prettier --github-user myusername vscode_export.md
+  ide-chat-prettier --max-size 60000 large_export.md
+  
+Options:
+  -h, --help                 Show this help message
+  -v, --version              Show version information
+  -g, --github-user USER     Specify GitHub username for VS Code exports
+  -m, --max-size SIZE        Split output if larger than SIZE bytes (default: no split)
+  
+Notes:
+  - For VS Code exports, the tool will attempt to detect your GitHub username
+    automatically using 'gh api /user' if GitHub CLI is available
+  - You can override this with the --github-user option
+  - Use --max-size to split large outputs for GitHub comment limits (65536 chars)
+  
+EOF
+}
+
+sub show_version {
+    print "ide-chat-prettier version $VERSION\n";
+}
+
+sub get_github_username {
+    my ($explicit_user) = @_;
+    
+    # 明示的にユーザー名が指定された場合はそれを使用
+    return $explicit_user if $explicit_user;
+    
+    # GitHub CLIを使ってユーザー名を取得
+    my $gh_user = `gh api /user 2>/dev/null | jq -r '.login' 2>/dev/null`;
+    chomp $gh_user if defined $gh_user;
+    
+    if ($gh_user && $gh_user ne 'null' && $gh_user ne '') {
+        return $gh_user;
+    }
+    
+    # git config からユーザー名を推定（フォールバック）
+    my $git_user = `git config --get user.name 2>/dev/null`;
+    chomp $git_user if defined $git_user;
+    
+    if ($git_user && $git_user ne '') {
+        # スペースを除去してGitHubユーザー名っぽくする
+        $git_user =~ s/\s+//g;
+        return lc($git_user);
+    }
+    
+    return undef;
+}
+
+sub detect_format {
+    my ($content, $github_user) = @_;
+    
+    # Cursor形式の特徴を検出
+    if ($content =~ /^_Exported on.*?_/m && $content =~ /\*\*User\*\*/ && $content =~ /\*\*Cursor\*\*/) {
+        return 'cursor';
+    }
+    # VS Code形式の特徴を検出
+    elsif ($content =~ /GitHub Copilot:/ || 
+           ($github_user && $content =~ /^$github_user:\s/m) ||
+           $content =~ /^[a-zA-Z0-9_-]+:\s/m) {
+        return 'vscode';
+    }
+    
+    return 'unknown';
+}
+
+sub format_cursor_export {
+    my ($content, $github_user) = @_;
+    
+    my $format = detect_format($content, $github_user);
+    
+    if ($format eq 'cursor') {
+        return format_cursor_style($content);
+    } elsif ($format eq 'vscode') {
+        return format_vscode_style($content, $github_user);
+    } else {
+        die "Error: Unsupported chat export format. This tool supports Cursor and VS Code chat exports.\n" .
+            "For VS Code exports, make sure your GitHub username is detectable or specify it with --github-user.\n";
+    }
+}
+
+sub format_cursor_style {
+    my ($content) = @_;
+    
+    # エクスポート情報行（_Exported on...）を削除
+    $content =~ s/^_Exported on.*?_\s*\n//gm;
+    
+    # タイトル部分を抽出（最初の---より前）
+    my $title = '';
+    if ($content =~ /^(.*?)\n---\n/s) {
+        $title = $1;
+        $title =~ s/^\s+|\s+$//g;
+    }
+    
+    my $result = "$title\n\n";
+    my @conversations = ();
+    
+    # **User**と**Cursor**のペアを直接解析
+    my @lines = split(/\n/, $content);
+    my $current_speaker = '';
+    my $current_content = '';
+    my $in_conversation = 0;
+    
+    for my $line (@lines) {
+        # **User**または**Cursor**を発話者として認識
+        if ($line =~ /^\*\*(User|Cursor)\*\*\s*$/) {
+            # 前の発話者の内容を保存
+            if ($current_speaker && $current_content) {
+                push @conversations, {
+                    speaker => $current_speaker,
+                    content => $current_content
+                };
+            }
+            $current_speaker = $1;
+            $current_content = '';
+            $in_conversation = 1;
+        }
+        # ---区切りは無視（会話が続いている場合）
+        elsif ($line eq '---' && $in_conversation) {
+            # 区切り行は無視して継続
+            next;
+        }
+        # 通常の内容行
+        elsif ($in_conversation && $current_speaker) {
+            # 空行でない、または既に内容がある場合は追加
+            if ($line ne '' || $current_content ne '') {
+                $current_content .= ($current_content ? "\n" : '') . $line;
+            }
+        }
+    }
+    
+    # 最後の会話を追加
+    if ($current_speaker && $current_content) {
+        push @conversations, {
+            speaker => $current_speaker,
+            content => $current_content
+        };
+    }
+    
+    # 会話をペアで処理
+    for (my $i = 0; $i < @conversations; $i += 2) {
+        my $user_conv = $conversations[$i];
+        my $cursor_conv = $conversations[$i + 1];
+        
+        next unless $user_conv && $cursor_conv;
+        next unless $user_conv->{speaker} eq 'User' && $cursor_conv->{speaker} eq 'Cursor';
+        
+        my $user_content = $user_conv->{content};
+        my $cursor_content = $cursor_conv->{content};
+        
+        $user_content =~ s/^\s+|\s+$//g;
+        $cursor_content =~ s/^\s+|\s+$//g;
+        
+        next if !$user_content || !$cursor_content;
+        
+        # Userコメントの最初の行をサマリとして使用
+        my ($summary) = split(/\n/, $user_content, 2);
+        $summary =~ s/^\s+|\s+$//g;
+        
+        # 長すぎるサマリは単語境界で切り詰める
+        if (length($summary) > 100) {
+            $summary = substr($summary, 0, 97);
+            # 単語境界で切る
+            $summary =~ s/\s+\S*$//;
+            $summary .= '...';
+        }
+        
+        # HTMLエスケープ
+        $summary = escape_html($summary);
+        
+        # detailsブロックを構築
+        $result .= "<details>\n";
+        $result .= "<summary>$summary</summary>\n\n";
+        $result .= "**User:**\n\n";
+        $result .= "$user_content\n\n";
+        $result .= "**Cursor:**\n\n";
+        $result .= "$cursor_content\n\n";
+        $result .= "</details>\n\n";
+    }
+    
+    return $result;
+}
+
+sub format_vscode_style {
+    my ($content, $github_user) = @_;
+    
+    # GitHubユーザー名が指定されていない場合はエラー
+    unless ($github_user) {
+        die "Error: GitHub username is required for VS Code export format.\n" .
+            "Use --github-user option or ensure 'gh' CLI is available and authenticated.\n";
+    }
+    
+    # ファイルパス行を削除
+    $content =~ s/^<!-- filepath:.*?-->\s*\n//gm;
+    
+    my $result = "";
+    my @conversations = ();
+    
+    # VS Codeの会話を解析（発話者: 内容の形式）
+    my @lines = split(/\n/, $content);
+    my $current_speaker = '';
+    my $current_content = '';
+    
+    for my $line (@lines) {
+        # GitHubユーザー名またはGitHub Copilotを発話者として認識
+        if ($line =~ /^($github_user|GitHub Copilot|VS Code):\s*(.*)$/i) {
+            # 新しい発話者
+            if ($current_speaker && $current_content) {
+                push @conversations, {
+                    speaker => $current_speaker,
+                    content => $current_content
+                };
+            }
+            $current_speaker = $1;
+            $current_content = $2 || '';
+        } else {
+            # 継続行
+            if ($current_speaker) {
+                $current_content .= ($current_content ? "\n" : '') . $line;
+            }
+        }
+    }
+    
+    # 最後の会話を追加
+    if ($current_speaker && $current_content) {
+        push @conversations, {
+            speaker => $current_speaker,
+            content => $current_content
+        };
+    }
+    
+    # デバッグ情報（開発時のみ）
+    # print STDERR "Found " . scalar(@conversations) . " conversation parts\n";
+    
+    # タイトルを生成（最初の質問から）
+    my $title = "# Chat Session";
+    if (@conversations && $conversations[0]->{content}) {
+        my ($first_line) = split(/\n/, $conversations[0]->{content}, 2);
+        $first_line =~ s/^\s+|\s+$//g;
+        if (length($first_line) > 50) {
+            $first_line = substr($first_line, 0, 47) . '...';
+        }
+        $title = "# $first_line" if $first_line;
+    }
+    
+    $result .= "$title\n\n";
+    
+    # 会話をペアで処理
+    for (my $i = 0; $i < @conversations; $i += 2) {
+        my $user_conv = $conversations[$i];
+        my $assistant_conv = $conversations[$i + 1];
+        
+        next unless $user_conv && $assistant_conv;
+        
+        my $user_content = $user_conv->{content};
+        my $assistant_content = $assistant_conv->{content};
+        
+        $user_content =~ s/^\s+|\s+$//g;
+        $assistant_content =~ s/^\s+|\s+$//g;
+        
+        next if !$user_content || !$assistant_content;
+        
+        # サマリーを生成
+        my ($summary) = split(/\n/, $user_content, 2);
+        $summary =~ s/^\s+|\s+$//g;
+        
+        if (length($summary) > 100) {
+            $summary = substr($summary, 0, 97);
+            $summary =~ s/\s+\S*$//;
+            $summary .= '...';
+        }
+        
+        $summary = escape_html($summary);
+        
+        $result .= "<details>\n";
+        $result .= "<summary>$summary</summary>\n\n";
+        $result .= "**$user_conv->{speaker}:**\n\n";
+        $result .= "$user_content\n\n";
+        $result .= "**$assistant_conv->{speaker}:**\n\n";
+        $result .= "$assistant_content\n\n";
+        $result .= "</details>\n\n";
+    }
+    
+    return $result;
+}
+
+sub escape_html {
+    my ($text) = @_;
+    $text =~ s/&/&amp;/g;
+    $text =~ s/</&lt;/g;
+    $text =~ s/>/&gt;/g;
+    $text =~ s/"/&quot;/g;
+    $text =~ s/'/&#39;/g;
+    return $text;
+}
+
+sub split_by_size {
+    my ($content, $max_size, $title) = @_;
+    
+    # max_sizeが指定されていない場合はそのまま返す
+    return ($content) unless $max_size && $max_size > 0;
+    
+    # 現在のサイズが制限以下の場合もそのまま返す
+    return ($content) if length($content) <= $max_size;
+    
+    # タイトル行を抽出
+    my $title_line = '';
+    if ($content =~ /^(# .*?)\n\n/) {
+        $title_line = $1;
+    } elsif ($title) {
+        $title_line = "# $title";
+    } else {
+        $title_line = "# Chat Session";
+    }
+    
+    # <details>ブロックごとに分割
+    my @blocks = split(/(?=<details>)/, $content);
+    my $header = shift @blocks || '';  # タイトル部分
+    
+    my @parts = ();
+    my $current_part = $header;
+    my $part_number = 1;
+    
+    for my $block (@blocks) {
+        next unless $block;
+        
+        # 現在のパートにブロックを追加した場合のサイズを計算
+        my $test_content = $current_part . $block;
+        
+        if (length($test_content) > $max_size && $current_part ne $header) {
+            # 現在のパートを確定して新しいパートを開始
+            push @parts, $current_part;
+            $current_part = $header;
+            $current_part =~ s/^# (.*)$/"# $1 (" . $part_number . "\/TBD)"/e;
+            $part_number++;
+        }
+        
+        $current_part .= $block;
+    }
+    
+    # 最後のパートを追加
+    push @parts, $current_part if $current_part;
+    
+    # パート番号を正しく更新
+    my $total_parts = scalar @parts;
+    for my $i (0 .. $#parts) {
+        my $part_num = $i + 1;
+        $parts[$i] =~ s/^# (.+?) \(\d+\/TBD\)/"# $1 ($part_num\/$total_parts)"/e;
+    }
+    
+    return @parts;
+}
+
+# メイン処理
+sub main {
+    my $help = 0;
+    my $version = 0;
+    my $github_user = '';
+    my $max_size = 0;
+    
+    # コマンドラインオプションの解析
+    my $result = GetOptions(
+        'help|h'         => \$help,
+        'version|v'      => \$version,
+        'github-user|g=s' => \$github_user,
+        'max-size|m=i'   => \$max_size,
+    );
+    
+    if (!$result) {
+        print STDERR "Error: Invalid command line options.\n\n";
+        show_help();
+        exit 1;
+    }
+    
+    if ($help) {
+        show_help();
+        exit 0;
+    }
+    
+    if ($version) {
+        show_version();
+        exit 0;
+    }
+    
+    # 残りの引数（ファイル名）を取得
+    my $input_file = shift @ARGV;
+    my $output_file = shift @ARGV;
+    
+    # 余分な引数があるかチェック
+    if (@ARGV) {
+        print STDERR "Error: Too many arguments.\n\n";
+        show_help();
+        exit 1;
+    }
+    
+    # 引数チェック
+    if (!$input_file) {
+        print STDERR "Error: Input file is required.\n\n";
+        show_help();
+        exit 1;
+    }
+    
+    # 入力ファイルの存在チェック
+    if (!-f $input_file) {
+        print STDERR "Error: Input file '$input_file' not found.\n";
+        exit 1;
+    }
+    
+    # 入力ファイルを読み込み
+    open my $fh, '<:utf8', $input_file or die "Cannot open '$input_file': $!";
+    my $content = do { local $/; <$fh> };
+    close $fh;
+    
+    # GitHubユーザー名を取得（必要に応じて）
+    my $detected_user = get_github_username($github_user);
+    if (!$github_user && $detected_user) {
+        $github_user = $detected_user;
+        print STDERR "Detected GitHub username: $github_user\n";
+    }
+    
+    # フォーマット処理
+    my $formatted = format_cursor_export($content, $github_user);
+    
+    # サイズ制限による分割処理
+    my @parts = split_by_size($formatted, $max_size);
+    
+    # 出力
+    if ($output_file) {
+        if (@parts > 1) {
+            # 複数パートに分割された場合
+            for my $i (0 .. $#parts) {
+                my $part_num = $i + 1;
+                my $part_file = $output_file;
+                if ($part_file =~ s/(\.[^.]+)$/_part$part_num$1/) {
+                    # 拡張子がある場合
+                } else {
+                    # 拡張子がない場合
+                    $part_file .= "_part$part_num";
+                }
+                
+                open my $out_fh, '>:utf8', $part_file or die "Cannot create '$part_file': $!";
+                print $out_fh $parts[$i];
+                close $out_fh;
+                print "Part $part_num written to: $part_file\n";
+            }
+            print "Split into " . scalar(@parts) . " parts due to size limit ($max_size bytes)\n";
+        } else {
+            # 単一ファイル出力
+            open my $out_fh, '>:utf8', $output_file or die "Cannot create '$output_file': $!";
+            print $out_fh $formatted;
+            close $out_fh;
+            print "Formatted output written to: $output_file\n";
+        }
+    } else {
+        if (@parts > 1) {
+            # stdout出力の場合は警告して最初のパートのみ表示
+            print STDERR "Warning: Output split into " . scalar(@parts) . " parts. Showing first part only.\n";
+            print STDERR "Use --output option to save all parts.\n\n";
+        }
+        print $parts[0];
+    }
+    
+    return 0;
+}
+
+# スクリプトとして実行された場合のみmainを呼び出し
+exit main() unless caller;
+
+__END__
+
+=head1 NAME
+
+ide-chat-prettier - Format IDE chat exports for GitHub Issues/PRs
+
+=head1 SYNOPSIS
+
+ide-chat-prettier [options] input-file [output-file]
+
+=head1 DESCRIPTION
+
+This tool converts IDE chat export files (Cursor, VS Code) into a more readable format 
+suitable for GitHub Issues and Pull Requests. It transforms User/AI interactions 
+into collapsible details sections with summaries.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-h, --help>
+
+Show help message and exit.
+
+=item B<-v, --version>
+
+Show version information and exit.
+
+=item B<-g, --github-user USER>
+
+Specify GitHub username for VS Code exports.
+
+=back
+
+=head1 EXAMPLES
+
+  # Basic usage - output to stdout
+  ide-chat-prettier cursor_export.md
+  
+  # Specify output file
+  ide-chat-prettier cursor_export.md formatted_output.md
+  
+  # With GitHub username for VS Code exports
+  ide-chat-prettier --github-user myusername vscode_export.md
+
+=head1 AUTHOR
+
+Created for formatting IDE chat exports.
+
+=cut
