@@ -17,3 +17,7 @@ Now supports:
 - VSCode
 - Cursor
 
+**Documentation:**
+- [Manual (Japanese)](./docs/ide-chat-prettier.ja.md)
+- [Manual (English)](./docs/ide-chat-prettier.en.md)
+
