@@ -6,7 +6,7 @@ ide-chat-prettier makes exported AI editor chat content more readable.
 It supports Visual Studio Code Copilot and Cursor.
 
 Specifically, it wraps each user-AI conversation pair with details summary elements.
-This makes extremely long chat sessions much easier to read and navigate.
+This allows you to paste extremely long chat sessions into GitHub Issues or Pull Requests in a readable format.
 
 ## Installation
 
@@ -14,15 +14,19 @@ Simply add execute permission to the downloaded file and place it in a directory
 For example, if `/usr/local/bin` is in your PATH, you can install the downloaded ide-chat-prettier with:
 
 ```shell-script
-$ chmod +x ide-chat-prettier 
-$ sudo cp ide-chat-prettier /usr/local/bin/
+chmod +x ide-chat-prettier 
+```
+
+```shell-script
+sudo cp ide-chat-prettier /usr/local/bin/
 ```
 
 For directories like `/usr/local/bin` that require root write permissions, use sudo and
 enter your sudo password as needed.
 
-The runtime requirement is Perl 5.10 or later. For example, in most Linux environments as of 2025, 
+The runtime requirement is Perl 5.10 or later. For example, in most Linux and macOS environments as of 2025, 
 environments that don't meet this requirement are extremely rare.
+It doesn't use any external modules and runs standalone.
 
 ## Usage
 
@@ -57,31 +61,46 @@ ide-chat-prettier vscode_export.md
 
 ## How to Export AI Chat Content
 
+To use ide-chat-prettier, you first need to export the AI editor chat content to a file.
+
+ide-chat-prettier automatically detects whether the chat format is from VSCode Copilot or Cursor and processes it appropriately.
+
 ### For VSCode
 
 Click on an empty area in the chat window and select "Copy All" from the context menu.
 This will copy the content to your clipboard.
 
-On macOS, since the pbpaste command outputs clipboard content, you can use bash/zsh process substitution `<(...)` 
-to treat the output as a temporary file:
+On macOS, since the pbpaste command outputs clipboard content, you can save the clipboard content to a file:
 
 ```
-ide-chat-prettier <(pbpaste)
+pbpaste > vscode_chat_export.md
 ```
 
-This allows you to get the conversion results directly.
-
-You can combine it with pbcopy (the reverse of pbpaste) to replace clipboard content with the converted version:
+Then process it with:
 
 ```
-ide-chat-prettier <(pbpaste) | pbcopy
+ide-chat-prettier vscode_chat_export.md
 ```
 
-This replaces the clipboard content with the converted version (note: not idempotent, so be careful about repeated execution).
+You can combine it with pbcopy to replace clipboard content with the converted version:
+
+```
+ide-chat-prettier vscode_chat_export.md | pbcopy
+```
 
 ### For Cursor
 
 Select "Export Chat" from the `...` menu in the top menu bar of the chat window to export as a file.
+
+The rest is the same as the VSCode case above.
+
+```
+ide-chat-prettier cursor_export.md
+```
+
+```
+ide-chat-prettier cursor_export.md | pbcopy
+```
 
 ## License
 
